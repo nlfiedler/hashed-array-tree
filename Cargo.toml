@@ -1,0 +1,21 @@
+[package]
+name = "hashed-array-tree"
+version = "1.0.0"
+edition = "2024"
+authors = ["Nathan Fiedler <nathanfiedler@fastmail.fm>"]
+description = "Hashed Array Trees"
+repository = "https://github.com/nlfiedler/hashed-array-tree"
+readme = "README.md"
+keywords = [
+    "collections",
+    "dynamic-arrays",
+    "extensible-arrays",
+    "resizable-arrays",
+    "data-structures",
+]
+categories = ["data-structures"]
+license = "MIT"
+exclude = ["TODO.org", "test/*"]
+
+[dev-dependencies]
+ulid = "1.2.1"
