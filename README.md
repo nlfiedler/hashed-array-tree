@@ -2,7 +2,7 @@
 
 ## Overview
 
-This Rust crate provides an implementation of hashed array trees as described by Edward Sitarski in the Algorithm Alley section of the September 1996 edition of Dr. Dobb's Journal.
+This Rust crate provides an implementation of hashed array trees as described by Edward Sitarski in the Algorithm Alley column of the September 1996 edition of Dr. Dobb's Journal.
 
 This data structure supports `push` and `pop` operations and does _not_ support inserts or removes at other locations within the array. One exception is the `swap/remove` operation which will retrieve a value from a specified index, overwrite that slot with the value at the end of the array, decrement the count, and return the retrieved value.
 

@@ -56,4 +56,25 @@ fn main() {
             break;
         }
     }
+
+    // test append() handling of dealloc and preventing drop
+    let odds = ["one", "three", "five", "seven", "nine"];
+    let mut array = HashedArrayTree::<String>::new();
+    for item in odds {
+        array.push(item.to_owned());
+    }
+    let evens = ["two", "four", "six", "eight"];
+    let mut other = HashedArrayTree::<String>::new();
+    for item in evens {
+        other.push(item.to_owned());
+    }
+    array.append(&mut other);
+
+    // test dedup_by() handling of dealloc and drop
+    let inputs = ["foo", "bar", "Bar", "baz", "bar"];
+    let mut array = HashedArrayTree::<String>::new();
+    for item in inputs {
+        array.push(item.to_owned());
+    }
+    array.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
 }

@@ -3,15 +3,15 @@
 //
 
 //! An implementation of Hashed Array Trees by Edward Sitarski.
-//! 
+//!
 //! From the original article:
-//! 
+//!
 //! > To overcome the limitations of variable-length arrays, I created a data
 //! > structure that has fast constant access time like an array, but mostly
 //! > avoids copying elements when it grows. I call this new structure a
 //! > "Hashed-Array Tree" (HAT) because it combines some of the features of hash
 //! > tables, arrays, and trees.
-//! 
+//!
 //! To achieve this, the data structure uses a standard growable vector to
 //! reference separate data blocks which hold the array elements. The index and
 //! the blocks are at most O(√N) in size. As more elements are added, the size
@@ -24,9 +24,9 @@
 //! elements are added the array will grow by allocating additional data blocks.
 //! Likewise, as elements are removed from the end of the array, data blocks
 //! will be deallocated as they become empty.
-//! 
+//!
 //! # Performance
-//! 
+//!
 //! The get and set operations are O(1) while the push and pop may take O(N) in
 //! the worst case, if the array needs to be grown or shrunk.
 //!
@@ -37,6 +37,7 @@
 //! throughout the code.
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::cmp::Ordering;
 use std::fmt;
 use std::ops::{Index, IndexMut};
 
@@ -159,6 +160,13 @@ impl<T> HashedArrayTree<T> {
         }
     }
 
+    /// Like `get()` but without the `Option` wrapper.
+    fn raw_get(&self, index: usize) -> &T {
+        let block = index >> self.k;
+        let slot = index & self.k_mask;
+        unsafe { &*self.index[block].add(slot) }
+    }
+
     /// Retrieve a reference to the element at the given offset.
     ///
     /// # Time complexity
@@ -168,9 +176,7 @@ impl<T> HashedArrayTree<T> {
         if index >= self.count {
             None
         } else {
-            let block = index >> self.k;
-            let slot = index & self.k_mask;
-            unsafe { Some(&*self.index[block].add(slot)) }
+            Some(self.raw_get(index))
         }
     }
 
@@ -281,6 +287,10 @@ impl<T> HashedArrayTree<T> {
     /// The removed element is replaced by the last element of the array.
     ///
     /// This does not preserve ordering of the remaining elements.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is out of bounds.
     ///
     /// # Time complexity
     ///
@@ -398,6 +408,170 @@ impl<T> HashedArrayTree<T> {
         self.upper_limit = self.l * self.l;
         self.lower_limit = 0;
     }
+
+    /// Swap two elements in the array.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either index is out of bounds.
+    ///
+    pub fn swap(&mut self, a: usize, b: usize) {
+        if a >= self.count {
+            panic!("swap a (is {a}) should be < len (is {})", self.count);
+        }
+        if b >= self.count {
+            panic!("swap b (is {b}) should be < len (is {})", self.count);
+        }
+        // save the value in slot a before overwriting with value from slot b,
+        // then write the saved value to slot b
+        let a_block = a >> self.k;
+        let a_slot = a & self.k_mask;
+        let b_block = b >> self.k;
+        let b_slot = b & self.k_mask;
+        unsafe {
+            let a_ptr = self.index[a_block].add(a_slot);
+            let value = a_ptr.read();
+            let b_ptr = self.index[b_block].add(b_slot);
+            std::ptr::copy(b_ptr, a_ptr, 1);
+            std::ptr::write(b_ptr, value);
+        }
+    }
+
+    /// Sorts the slice in ascending order with a comparison function,
+    /// **without** preserving the initial order of equal elements.
+    ///
+    /// This sort is unstable (i.e., may reorder equal elements), in-place
+    /// (i.e., does not allocate), and *O*(*n* \* log(*n*)) worst-case.
+    ///
+    /// Implements the standard heapsort algorithm.
+    pub fn sort_unstable_by<F>(&mut self, mut compare: F)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+    {
+        if self.count < 2 {
+            return;
+        }
+        let mut start = self.count / 2;
+        let mut end = self.count;
+        while end > 1 {
+            if start > 0 {
+                start -= 1;
+            } else {
+                end -= 1;
+                self.swap(end, 0);
+            }
+            let mut root = start;
+            let mut child = 2 * root + 1;
+            while child < end {
+                if child + 1 < end && compare(&self[child], &self[child + 1]) == Ordering::Less {
+                    child += 1;
+                }
+                if compare(&self[root], &self[child]) == Ordering::Less {
+                    self.swap(root, child);
+                    root = child;
+                    child = 2 * root + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Removes all but the first of consecutive elements in the array
+    /// satisfying a given equality relation.
+    ///
+    /// The `same_bucket` function is passed references to two elements from the
+    /// array and must determine if the elements compare equal. The elements are
+    /// passed in reverse order from their order in the array, so if
+    /// `same_bucket(a, b)` returns `true`, `a` is removed.
+    ///
+    /// If the array is sorted, this removes all duplicates.
+    pub fn dedup_by<F>(&mut self, mut same_bucket: F)
+    where
+        F: FnMut(&T, &T) -> bool,
+    {
+        let len = self.len();
+        if len <= 1 {
+            return;
+        }
+
+        // Check if any duplicates exist to avoid allocating, copying, and
+        // deallocating memory if nothing needs to be removed.
+        let mut first_duplicate_idx: usize = 1;
+        while first_duplicate_idx != len {
+            let found_duplicate = {
+                let prev = self.raw_get(first_duplicate_idx - 1);
+                let current = self.raw_get(first_duplicate_idx);
+                same_bucket(current, prev)
+            };
+            if found_duplicate {
+                break;
+            }
+            first_duplicate_idx += 1;
+        }
+        if first_duplicate_idx == len {
+            return;
+        }
+
+        // duplicates exist, build a new array of only unique values; steal the
+        // old index and sizes, then clear the rest of the properties in order
+        // to start over
+        let index = std::mem::take(&mut self.index);
+        let old_l = self.l;
+        let mut remaining = self.count - 1;
+        self.count = 0;
+        self.clear();
+        let layout = Layout::array::<T>(old_l).expect("unexpected overflow");
+
+        // read the first value (we know there are at least two) to get the
+        // process started
+        let mut prev = unsafe { index[0].read() };
+        let mut slot = 1;
+        for buffer in index.into_iter() {
+            while slot < old_l {
+                let current = unsafe { buffer.add(slot).read() };
+                if same_bucket(&current, &prev) {
+                    drop(current);
+                } else {
+                    self.push(prev);
+                    prev = current;
+                }
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+                slot += 1;
+            }
+            unsafe {
+                dealloc(buffer as *mut u8, layout);
+            }
+            slot = 0;
+        }
+        // the last element always gets saved
+        self.push(prev);
+    }
+
+    /// Moves all the elements of `other` into `self`, leaving `other` empty.
+    pub fn append(&mut self, other: &mut Self) {
+        let index = std::mem::take(&mut other.index);
+        let mut remaining = other.count;
+        // prevent other from performing any dropping
+        other.count = 0;
+        let layout = Layout::array::<T>(other.l).expect("unexpected overflow");
+        for buffer in index.into_iter() {
+            for slot in 0..other.l {
+                let value = unsafe { buffer.add(slot).read() };
+                self.push(value);
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            unsafe {
+                dealloc(buffer as *mut u8, layout);
+            }
+        }
+    }
 }
 
 impl<T> Default for HashedArrayTree<T> {
@@ -443,6 +617,18 @@ impl<T> Drop for HashedArrayTree<T> {
         self.clear();
     }
 }
+
+impl<T: Clone> Clone for HashedArrayTree<T> {
+    fn clone(&self) -> Self {
+        let mut result = HashedArrayTree::<T>::new();
+        for value in self.iter() {
+            result.push(value.clone());
+        }
+        result
+    }
+}
+
+unsafe impl<T: Send> Send for HashedArrayTree<T> {}
 
 impl<A> FromIterator<A> for HashedArrayTree<A> {
     fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
@@ -749,6 +935,236 @@ mod tests {
         }
         assert_eq!(sut.len(), 512);
         // implicitly drop()
+    }
+
+    #[test]
+    fn test_clone_ints() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        for value in 0..512 {
+            sut.push(value);
+        }
+        let cloned = sut.clone();
+        let ai = sut.iter();
+        let bi = cloned.iter();
+        for (a, b) in ai.zip(bi) {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn test_clone_strings() {
+        let mut sut = HashedArrayTree::<String>::new();
+        for _ in 0..64 {
+            let value = ulid::Ulid::new().to_string();
+            sut.push(value);
+        }
+        let cloned = sut.clone();
+        let ai = sut.iter();
+        let bi = cloned.iter();
+        for (a, b) in ai.zip(bi) {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn test_swap() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        sut.push(1);
+        sut.push(2);
+        sut.push(3);
+        sut.push(4);
+        sut.swap(1, 3);
+        assert_eq!(sut[0], 1);
+        assert_eq!(sut[1], 4);
+        assert_eq!(sut[2], 3);
+        assert_eq!(sut[3], 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "swap a (is 1) should be < len (is 1)")]
+    fn test_swap_panic_a() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        sut.push(1);
+        sut.swap(1, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "swap b (is 1) should be < len (is 1)")]
+    fn test_swap_panic_b() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        sut.push(1);
+        sut.swap(0, 1);
+    }
+
+    #[test]
+    fn test_sort_unstable_by_ints() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        sut.push(10);
+        sut.push(1);
+        sut.push(100);
+        sut.push(20);
+        sut.push(2);
+        sut.push(99);
+        sut.push(88);
+        sut.push(77);
+        sut.push(66);
+        sut.sort_unstable_by(|a, b| a.cmp(b));
+        assert_eq!(sut[0], 1);
+        assert_eq!(sut[1], 2);
+        assert_eq!(sut[2], 10);
+        assert_eq!(sut[3], 20);
+        assert_eq!(sut[4], 66);
+        assert_eq!(sut[5], 77);
+        assert_eq!(sut[6], 88);
+        assert_eq!(sut[7], 99);
+        assert_eq!(sut[8], 100);
+    }
+
+    #[test]
+    fn test_sort_unstable_by_strings() {
+        let mut sut = HashedArrayTree::<String>::new();
+        sut.push("cat".into());
+        sut.push("ape".into());
+        sut.push("zebra".into());
+        sut.push("dog".into());
+        sut.push("bird".into());
+        sut.push("tapir".into());
+        sut.push("monkey".into());
+        sut.push("giraffe".into());
+        sut.push("frog".into());
+        sut.sort_unstable_by(|a, b| a.cmp(b));
+        assert_eq!(sut[0], "ape");
+        assert_eq!(sut[1], "bird");
+        assert_eq!(sut[2], "cat");
+        assert_eq!(sut[3], "dog");
+        assert_eq!(sut[4], "frog");
+        assert_eq!(sut[5], "giraffe");
+        assert_eq!(sut[6], "monkey");
+        assert_eq!(sut[7], "tapir");
+        assert_eq!(sut[8], "zebra");
+    }
+
+    #[test]
+    fn test_append() {
+        let odds = ["one", "three", "five", "seven", "nine"];
+        let mut sut = HashedArrayTree::<String>::new();
+        for item in odds {
+            sut.push(item.to_owned());
+        }
+        let evens = ["two", "four", "six", "eight", "ten"];
+        let mut other = HashedArrayTree::<String>::new();
+        for item in evens {
+            other.push(item.to_owned());
+        }
+        sut.append(&mut other);
+        assert_eq!(sut.len(), 10);
+        assert_eq!(sut.capacity(), 12);
+        assert_eq!(other.len(), 0);
+        assert_eq!(other.capacity(), 0);
+        sut.sort_unstable_by(|a, b| a.cmp(b));
+        assert_eq!(sut[0], "eight");
+        assert_eq!(sut[1], "five");
+        assert_eq!(sut[2], "four");
+        assert_eq!(sut[3], "nine");
+        assert_eq!(sut[4], "one");
+        assert_eq!(sut[5], "seven");
+        assert_eq!(sut[6], "six");
+        assert_eq!(sut[7], "ten");
+        assert_eq!(sut[8], "three");
+        assert_eq!(sut[9], "two");
+    }
+
+    #[test]
+    fn test_dedup_by_tiny() {
+        let mut sut = HashedArrayTree::<String>::new();
+        sut.push("one".into());
+        sut.dedup_by(|a, b| a == b);
+        assert_eq!(sut.len(), 1);
+        assert_eq!(sut[0], "one");
+    }
+
+    #[test]
+    fn test_dedup_by_2_dupes() {
+        let mut sut = HashedArrayTree::<String>::new();
+        sut.push("one".into());
+        sut.push("one".into());
+        sut.dedup_by(|a, b| a == b);
+        assert_eq!(sut.len(), 1);
+        assert_eq!(sut[0], "one");
+    }
+
+    #[test]
+    fn test_dedup_by_2_unique() {
+        let mut sut = HashedArrayTree::<String>::new();
+        sut.push("one".into());
+        sut.push("two".into());
+        sut.dedup_by(|a, b| a == b);
+        assert_eq!(sut.len(), 2);
+        assert_eq!(sut[0], "one");
+        assert_eq!(sut[1], "two");
+    }
+
+    #[test]
+    fn test_dedup_by_all_unique() {
+        let inputs = [
+            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        ];
+        let mut sut = HashedArrayTree::<String>::new();
+        for item in inputs {
+            sut.push(item.to_owned());
+        }
+        sut.dedup_by(|a, b| a == b);
+        assert_eq!(sut.len(), 9);
+        for (idx, elem) in sut.into_iter().enumerate() {
+            assert_eq!(inputs[idx], elem);
+        }
+    }
+
+    #[test]
+    fn test_dedup_by_all_dupes() {
+        let inputs = [
+            "one", "one", "one", "one", "one", "one", "one", "one", "one", "one",
+        ];
+        let mut sut = HashedArrayTree::<String>::new();
+        for item in inputs {
+            sut.push(item.to_owned());
+        }
+        assert_eq!(sut.len(), 10);
+        sut.dedup_by(|a, b| a == b);
+        assert_eq!(sut.len(), 1);
+        assert_eq!(inputs[0], "one");
+    }
+
+    #[test]
+    fn test_dedup_by_some_dupes_ints() {
+        let inputs = [1, 2, 2, 3, 2];
+        let mut sut = HashedArrayTree::<usize>::new();
+        for item in inputs {
+            sut.push(item.to_owned());
+        }
+        assert_eq!(sut.len(), 5);
+        sut.dedup_by(|a, b| a == b);
+        assert_eq!(sut.len(), 4);
+        assert_eq!(sut[0], 1);
+        assert_eq!(sut[1], 2);
+        assert_eq!(sut[2], 3);
+        assert_eq!(sut[3], 2);
+    }
+
+    #[test]
+    fn test_dedup_by_some_dupes_strings() {
+        let inputs = ["foo", "bar", "Bar", "baz", "bar"];
+        let mut sut = HashedArrayTree::<String>::new();
+        for item in inputs {
+            sut.push(item.to_owned());
+        }
+        assert_eq!(sut.len(), 5);
+        sut.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        assert_eq!(sut.len(), 4);
+        assert_eq!(sut[0], "foo");
+        assert_eq!(sut[1], "bar");
+        assert_eq!(sut[2], "baz");
+        assert_eq!(sut[3], "bar");
     }
 
     #[test]
