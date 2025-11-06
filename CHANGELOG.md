@@ -5,6 +5,12 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 This file follows the convention described at
 [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
+## [1.2.0] - 2025-11-05
+### Fixed
+- Panic when dropping an empty `IntoIterator`.
+### Added
+- Add `hat!` macro, add `split_off()` and `truncate()` functions.
+
 ## [1.1.0] - 2025-10-28
 ### Added
 - Add `Clone` implementation for elements that implement `Clone`.

@@ -77,4 +77,22 @@ fn main() {
         array.push(item.to_owned());
     }
     array.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+    // test split_off()
+    let inputs = ["foo", "bar", "baz", "quux", "one", "two", "tree"];
+    let mut array = HashedArrayTree::<String>::new();
+    for item in inputs {
+        array.push(item.to_owned());
+    }
+    let _ = array.split_off(4);
+
+    // test truncate()
+    let inputs = ["foo", "bar", "baz", "quux", "one", "two", "tree"];
+    let mut array = HashedArrayTree::<String>::new();
+    for item in inputs {
+        array.push(item.to_owned());
+    }
+    array.truncate(4);
+
+    println!("hashed array tree tests complete");
 }

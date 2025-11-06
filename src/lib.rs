@@ -141,7 +141,7 @@ impl<T> HashedArrayTree<T> {
         }
         let block = len >> self.k;
         let slot = len & self.k_mask;
-        unsafe { std::ptr::write(self.index[block].add(slot), value) }
+        unsafe { self.index[block].add(slot).write(value) }
         self.count += 1;
     }
 
@@ -160,7 +160,9 @@ impl<T> HashedArrayTree<T> {
         }
     }
 
-    /// Like `get()` but without the `Option` wrapper.
+    /// Like [`Self::get()`] but without the `Option` wrapper.
+    ///
+    /// Will panic if the index is out of bounds.
     fn raw_get(&self, index: usize) -> &T {
         let block = index >> self.k;
         let slot = index & self.k_mask;
@@ -234,6 +236,30 @@ impl<T> HashedArrayTree<T> {
         self.lower_limit = self.upper_limit / 8;
     }
 
+    /// Like [`Self::pop()`] but without the `Option` wrapper.
+    ///
+    /// Will panic if the array is empty.
+    pub fn raw_pop(&mut self) -> T {
+        let index = self.count - 1;
+        // avoid compressing the leaves smaller than 4
+        if index < self.lower_limit && self.k > 2 {
+            self.compress();
+        }
+        let block = index >> self.k;
+        let slot = index & self.k_mask;
+        let ret = unsafe { self.index[block].add(slot).read() };
+        if slot == 0 {
+            // prune leaves as they become empty
+            let ptr = self.index.pop().unwrap();
+            let layout = Layout::array::<T>(self.l).expect("unexpected overflow");
+            unsafe {
+                dealloc(ptr as *mut u8, layout);
+            }
+        }
+        self.count -= 1;
+        ret
+    }
+
     /// Removes the last element from the array and returns it, or `None` if the
     /// array is empty.
     ///
@@ -242,24 +268,7 @@ impl<T> HashedArrayTree<T> {
     /// O(N) in the worst case (shrink).
     pub fn pop(&mut self) -> Option<T> {
         if self.count > 0 {
-            let index = self.count - 1;
-            // avoid compressing the leaves smaller than 4
-            if index < self.lower_limit && self.k > 2 {
-                self.compress();
-            }
-            let block = index >> self.k;
-            let slot = index & self.k_mask;
-            let ret = unsafe { Some(std::ptr::read(self.index[block].add(slot))) };
-            if slot == 0 {
-                // prune leaves as they become empty
-                let ptr = self.index.pop().unwrap();
-                let layout = Layout::array::<T>(self.l).expect("unexpected overflow");
-                unsafe {
-                    dealloc(ptr as *mut u8, layout);
-                }
-            }
-            self.count -= 1;
-            ret
+            Some(self.raw_pop())
         } else {
             None
         }
@@ -414,7 +423,6 @@ impl<T> HashedArrayTree<T> {
     /// # Panics
     ///
     /// Panics if either index is out of bounds.
-    ///
     pub fn swap(&mut self, a: usize, b: usize) {
         if a >= self.count {
             panic!("swap a (is {a}) should be < len (is {})", self.count);
@@ -433,7 +441,7 @@ impl<T> HashedArrayTree<T> {
             let value = a_ptr.read();
             let b_ptr = self.index[b_block].add(b_slot);
             std::ptr::copy(b_ptr, a_ptr, 1);
-            std::ptr::write(b_ptr, value);
+            b_ptr.write(value);
         }
     }
 
@@ -572,6 +580,66 @@ impl<T> HashedArrayTree<T> {
             }
         }
     }
+
+    /// Splits the collection into two at the given index.
+    ///
+    /// Returns a newly allocated array containing the elements in the range
+    /// `[at, len)`. After the call, the original array will be left containing
+    /// the elements `[0, at)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at > len`.
+    ///
+    /// # Time complexity
+    ///
+    /// O(N)
+    pub fn split_off(&mut self, at: usize) -> Self {
+        if at >= self.count {
+            panic!("index out of bounds: {at}");
+        }
+        // Unlike Vec, cannot simply cut the array into two parts, the structure
+        // is built around the number of elements in the array, and that changes
+        // no matter what the value of `at` might be.
+        //
+        // As such, pop elements from self and push onto other, maintaining the
+        // correct structure of both arrays, then reverse the elements in the
+        // other array to correct the order.
+        let mut other = Self::new();
+        while self.count > at {
+            other.push(self.raw_pop());
+        }
+        let mut low = 0;
+        let mut high = other.count - 1;
+        while low < high {
+            unsafe {
+                let lp = other.index[low >> other.k].add(low & other.k_mask);
+                let value = lp.read();
+                let hp = other.index[high >> other.k].add(high & other.k_mask);
+                std::ptr::copy(hp, lp, 1);
+                hp.write(value);
+            }
+            low += 1;
+            high -= 1;
+        }
+        other
+    }
+
+    /// Shortens the array, keeping the first `len` elements and dropping the
+    /// rest.
+    ///
+    /// If `len` is greater or equal to the array's current length, this has no
+    /// effect.
+    ///
+    /// # Time complexity
+    ///
+    /// O(N)
+    pub fn truncate(&mut self, len: usize) {
+        while self.count > len {
+            self.raw_pop();
+            // intentionally dropping the value
+        }
+    }
 }
 
 impl<T> Default for HashedArrayTree<T> {
@@ -702,7 +770,9 @@ impl<T> Drop for ArrayIntoIter<T> {
         use std::ptr::{drop_in_place, slice_from_raw_parts_mut};
         let block_len = 1 << self.k;
 
-        if std::mem::needs_drop::<T>() {
+        if self.count > 0 && std::mem::needs_drop::<T>() {
+            // if completely exhausted, the first block/slot will be past the
+            // end of the array and thus skip all drops below
             let first_block = self.index >> self.k;
             let first_slot = self.index & self.k_mask;
             let last_block = (self.count - 1) >> self.k;
@@ -719,7 +789,7 @@ impl<T> Drop for ArrayIntoIter<T> {
                         ));
                     }
                 }
-            } else {
+            } else if first_block < last_block {
                 // drop the remaining values in the first leaf
                 if block_len < self.count {
                     unsafe {
@@ -757,9 +827,54 @@ impl<T> Drop for ArrayIntoIter<T> {
     }
 }
 
+/// Creates a [`HashedArrayTree`] containing the arguments.
+///
+/// `hat!` allows `HashedArrayTree`s to be defined with the same syntax as array
+/// expressions, much like the `vec!` mocro from the standard library.
+#[macro_export]
+macro_rules! hat {
+    () => {
+        HashedArrayTree::new()
+    };
+    // Takes a comma-separated list of expressions
+    ( $($item:expr),* $(,)? ) => {
+        {
+            let mut result = HashedArrayTree::new();
+            $(
+                result.push($item);
+            )*
+            result
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hat_macro() {
+        let sut: HashedArrayTree<usize> = hat![];
+        assert_eq!(sut.len(), 0);
+        assert_eq!(sut.capacity(), 0);
+
+        let sut: HashedArrayTree<usize> = hat![1];
+        assert_eq!(sut.len(), 1);
+        assert_eq!(sut.capacity(), 4);
+
+        let sut = hat![1, 2, 3, 4, 5, 6, 7, 8, 9,];
+        assert_eq!(sut.len(), 9);
+        assert_eq!(sut.capacity(), 12);
+        assert_eq!(sut[0], 1);
+        assert_eq!(sut[1], 2);
+        assert_eq!(sut[2], 3);
+        assert_eq!(sut[3], 4);
+        assert_eq!(sut[4], 5);
+        assert_eq!(sut[5], 6);
+        assert_eq!(sut[6], 7);
+        assert_eq!(sut[7], 8);
+        assert_eq!(sut[8], 9);
+    }
 
     #[test]
     fn test_empty() {
@@ -1168,6 +1283,131 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "index out of bounds: 10")]
+    fn test_split_off_bounds_panic() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        sut.split_off(10);
+    }
+
+    #[test]
+    fn test_split_off_middle() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        for value in 0..16 {
+            sut.push(value);
+        }
+        assert_eq!(sut.len(), 16);
+        assert_eq!(sut.capacity(), 16);
+        let other = sut.split_off(8);
+        assert_eq!(sut.len(), 8);
+        assert_eq!(sut.capacity(), 8);
+        for value in 0..8 {
+            assert_eq!(sut[value], value);
+        }
+        assert_eq!(other.len(), 8);
+        assert_eq!(other.capacity(), 8);
+        for (index, value) in (8..16).enumerate() {
+            assert_eq!(other[index], value);
+        }
+    }
+
+    #[test]
+    fn test_split_off_almost_start() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        for value in 0..16 {
+            sut.push(value);
+        }
+        assert_eq!(sut.len(), 16);
+        assert_eq!(sut.capacity(), 16);
+        let other = sut.split_off(1);
+        assert_eq!(sut.len(), 1);
+        assert_eq!(sut.capacity(), 4);
+        for value in 0..1 {
+            assert_eq!(sut[value], value);
+        }
+        assert_eq!(other.len(), 15);
+        assert_eq!(other.capacity(), 16);
+        for (index, value) in (1..16).enumerate() {
+            assert_eq!(other[index], value);
+        }
+    }
+
+    #[test]
+    fn test_split_off_almost_end() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        for value in 0..16 {
+            sut.push(value);
+        }
+        assert_eq!(sut.len(), 16);
+        assert_eq!(sut.capacity(), 16);
+        let other = sut.split_off(15);
+        assert_eq!(sut.len(), 15);
+        assert_eq!(sut.capacity(), 16);
+        for value in 0..15 {
+            assert_eq!(sut[value], value);
+        }
+        assert_eq!(other.len(), 1);
+        assert_eq!(other.capacity(), 4);
+        assert_eq!(other[0], 15);
+    }
+
+    #[test]
+    fn test_split_off_odd_other() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        for value in 0..16 {
+            sut.push(value);
+        }
+        assert_eq!(sut.len(), 16);
+        assert_eq!(sut.capacity(), 16);
+        let other = sut.split_off(11);
+        assert_eq!(sut.len(), 11);
+        assert_eq!(sut.capacity(), 12);
+        for value in 0..11 {
+            assert_eq!(sut[value], value);
+        }
+        assert_eq!(other.len(), 5);
+        assert_eq!(other.capacity(), 8);
+        for (index, value) in (11..16).enumerate() {
+            assert_eq!(other[index], value);
+        }
+    }
+
+    #[test]
+    fn test_truncate_typical() {
+        let mut sut = hat![1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(sut.len(), 8);
+        assert_eq!(sut.capacity(), 8);
+        sut.truncate(5);
+        assert_eq!(sut.len(), 5);
+        assert_eq!(sut.capacity(), 8);
+        for (index, value) in (1..6).enumerate() {
+            assert_eq!(sut[index], value);
+        }
+    }
+
+    #[test]
+    fn test_truncate_out_of_bounds() {
+        let mut sut = hat![1, 2, 3, 4, 5,];
+        assert_eq!(sut.len(), 5);
+        assert_eq!(sut.capacity(), 8);
+        sut.truncate(8);
+        assert_eq!(sut.len(), 5);
+        assert_eq!(sut.capacity(), 8);
+        for (index, value) in (1..6).enumerate() {
+            assert_eq!(sut[index], value);
+        }
+    }
+
+    #[test]
+    fn test_truncate_to_empty() {
+        let mut sut = hat![1, 2, 3, 4, 5,];
+        assert_eq!(sut.len(), 5);
+        assert_eq!(sut.capacity(), 8);
+        sut.truncate(0);
+        assert_eq!(sut.len(), 0);
+        assert_eq!(sut.capacity(), 0);
+    }
+
+    #[test]
     fn test_from_iterator() {
         let mut inputs: Vec<i32> = Vec::new();
         for value in 0..10_000 {
@@ -1196,8 +1436,23 @@ mod tests {
     }
 
     #[test]
-    fn test_into_iterator() {
-        // an array that only requires a single segment
+    fn test_into_iterator_edge_case() {
+        // iterate to the end (of the last data block)
+        let inputs = [
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ];
+        let mut sut: HashedArrayTree<String> = HashedArrayTree::new();
+        for item in inputs {
+            sut.push(item.to_owned());
+        }
+        for (idx, elem) in sut.into_iter().enumerate() {
+            assert_eq!(inputs[idx], elem);
+        }
+        // sut.len(); // error: ownership of sut was moved
+    }
+
+    #[test]
+    fn test_into_iterator_multiple_leaves() {
         let inputs = [
             "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
         ];
@@ -1212,18 +1467,22 @@ mod tests {
     }
 
     #[test]
-    fn test_into_iterator_drop_tiny() {
+    fn test_into_iterator_drop_empty() {
+        let sut: HashedArrayTree<String> = HashedArrayTree::new();
+        assert_eq!(sut.into_iter().count(), 0);
+    }
+
+    #[test]
+    fn test_into_iterator_drop_single_leaf() {
         // an array that only requires a single segment and only some need to be
         // dropped after partially iterating the values
-        let inputs = [
-            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
-        ];
+        let inputs = ["one", "two", "three", "four"];
         let mut sut: HashedArrayTree<String> = HashedArrayTree::new();
         for item in inputs {
             sut.push(item.to_owned());
         }
         for (idx, _) in sut.into_iter().enumerate() {
-            if idx > 2 {
+            if idx > 1 {
                 break;
             }
         }
@@ -1232,7 +1491,7 @@ mod tests {
 
     #[test]
     fn test_into_iterator_drop_large() {
-        // by adding 512 values and iterating less than 64 times, there will be
+        // by adding 512 values and iterating less than 32 times, there will be
         // values in the first segment and some in the last segment, and two
         // segments inbetween that all need to be dropped
         let mut sut: HashedArrayTree<String> = HashedArrayTree::new();
@@ -1241,7 +1500,7 @@ mod tests {
             sut.push(value);
         }
         for (idx, _) in sut.into_iter().enumerate() {
-            if idx >= 30 {
+            if idx >= 28 {
                 break;
             }
         }
