@@ -34,9 +34,7 @@ The Rust edition is set to `2024` and hence version `1.85.0` is the minimum supp
 
 ### Memory Leaks
 
-Finding memory leaks with [Address Sanitizer](https://clang.llvm.org/docs/AddressSanitizer.html) is fairly [easy](https\
-://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html) and seems to work best on Linux. A Docker contai\
-ner with bash access and [Rust](https://rust-lang.org) nightly installed can be found in the `containers` directory.
+Finding memory leaks with [Address Sanitizer](https://clang.llvm.org/docs/AddressSanitizer.html) is fairly [easy](https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html) and seems to work best on Linux. A Docker container with bash access and [Rust](https://rust-lang.org) nightly installed can be found in the `containers` directory.
 
 ```shell
 cd containers
