@@ -333,13 +333,28 @@ impl<T> HashedArrayTree<T> {
         }
     }
 
-    // Returns an iterator over the array.
-    //
-    // The iterator yields all items from start to end.
+    /// Returns an iterator over the array.
+    ///
+    /// The iterator yields all items from start to end.
     pub fn iter(&self) -> ArrayIter<'_, T> {
         ArrayIter {
             array: self,
             index: 0,
+            count: self.count,
+        }
+    }
+
+    /// Returns an iterator that allows modifying each value.
+    ///
+    /// The iterator yields all items from start to end.
+    pub fn iter_mut(&mut self) -> ArrayIterMut<'_, T> {
+        ArrayIterMut {
+            dope: self.index.as_mut_ptr(),
+            index: 0,
+            count: self.count,
+            k: self.k,
+            k_mask: self.k_mask,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -712,17 +727,67 @@ impl<A> FromIterator<A> for HashedArrayTree<A> {
 pub struct ArrayIter<'a, T> {
     array: &'a HashedArrayTree<T>,
     index: usize,
+    count: usize,
 }
 
 impl<'a, T> Iterator for ArrayIter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let value = self.array.get(self.index);
-        self.index += 1;
-        value
+        if self.index < self.count {
+            let value = self.array.get(self.index);
+            self.index += 1;
+            value
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.count - self.index;
+        (remaining, Some(remaining))
     }
 }
+
+impl<'a, T> ExactSizeIterator for ArrayIter<'a, T> {}
+
+/// Mutable hashed array tree iterator.
+pub struct ArrayIterMut<'a, T> {
+    dope: *mut *mut T, // pointer into the dope vector's backing array
+    index: usize,
+    count: usize,
+    k: usize,
+    k_mask: usize,
+    _marker: std::marker::PhantomData<&'a mut T>,
+}
+
+impl<'a, T> Iterator for ArrayIterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.count {
+            let block = self.index >> self.k;
+            let slot = self.index & self.k_mask;
+            self.index += 1;
+            // SAFETY: `dope` points into the HAT's index vec, which is valid
+            // for `'a`. Each successive call increments `self.index`, so no two
+            // live references ever alias the same slot.
+            unsafe {
+                let block_ptr = *self.dope.add(block);
+                Some(&mut *block_ptr.add(slot))
+            }
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.count - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, T> ExactSizeIterator for ArrayIterMut<'a, T> {}
 
 /// An iterator that moves out of a hashed array tree.
 pub struct ArrayIntoIter<T> {
@@ -746,6 +811,11 @@ impl<T> Iterator for ArrayIntoIter<T> {
             None
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.count - self.index;
+        (remaining, Some(remaining))
+    }
 }
 
 impl<T> IntoIterator for HashedArrayTree<T> {
@@ -764,6 +834,8 @@ impl<T> IntoIterator for HashedArrayTree<T> {
         }
     }
 }
+
+impl<T> ExactSizeIterator for ArrayIntoIter<T> {}
 
 impl<T> Drop for ArrayIntoIter<T> {
     fn drop(&mut self) {
@@ -1433,6 +1505,27 @@ mod tests {
         for (idx, elem) in sut.iter().enumerate() {
             assert_eq!(sut[idx], *elem);
         }
+    }
+
+    #[test]
+    fn test_iter_mut() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        for value in 0..512 {
+            sut.push(value);
+        }
+        // double every element through the mutable iterator
+        for elem in sut.iter_mut() {
+            *elem *= 2;
+        }
+        for idx in 0..512 {
+            assert_eq!(sut[idx], idx * 2);
+        }
+    }
+
+    #[test]
+    fn test_iter_mut_empty() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        assert_eq!(sut.iter_mut().count(), 0);
     }
 
     #[test]

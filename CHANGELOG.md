@@ -5,6 +5,11 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 This file follows the convention described at
 [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
+## [1.3.0] - 2026-04-11
+### Added
+- Add `iter_mut()` implementation for `HashedArrayTree`.
+- Add `size_hint()` to all iterators and implement `ExactSizeIterator`.
+
 ## [1.2.0] - 2025-11-05
 ### Fixed
 - Panic when dropping an empty `IntoIterator`.
