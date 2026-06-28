@@ -19,7 +19,7 @@
 //!
 //! # Memory Usage
 //!
-//! An empty hased array tree is approximately 72 bytes in size, and while
+//! An empty hashed array tree is approximately 72 bytes in size, and while
 //! holding elements it will have a space overhead on the order of O(√N). As
 //! elements are added the array will grow by allocating additional data blocks.
 //! Likewise, as elements are removed from the end of the array, data blocks
@@ -35,6 +35,13 @@
 //! Because this data structure is allocating memory, copying bytes using
 //! pointers, and de-allocating memory as needed, there are many `unsafe` blocks
 //! throughout the code.
+//!
+//! # Limitations
+//!
+//! Zero-sized types (such as `()`) are **not** supported. The leaves are
+//! allocated with [`std::alloc::alloc`], which is undefined behavior for a
+//! zero-sized layout, and there is little value in storing a large number of
+//! zero-sized values in a vector-like collection anyway.
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cmp::Ordering;
@@ -218,6 +225,9 @@ impl<T> HashedArrayTree<T> {
                 }
                 ptr
             };
+            // Safe to copy a full `half` from each side: callers only invoke
+            // `compress()` when every leaf is completely full (see `raw_pop`),
+            // so both halves of `old_buffer` are fully initialized.
             unsafe {
                 std::ptr::copy(old_buffer, a, half);
                 std::ptr::copy(old_buffer.add(half), b, half);
@@ -242,6 +252,14 @@ impl<T> HashedArrayTree<T> {
     pub fn raw_pop(&mut self) -> T {
         let index = self.count - 1;
         // avoid compressing the leaves smaller than 4
+        //
+        // `compress()` requires that every leaf be completely full. That holds
+        // here because `lower_limit` is `l * l / 8`, which is always a multiple
+        // of `l`, and `pop` decrements the count one at a time, so the first pop
+        // to satisfy this condition does so exactly at `count == lower_limit`,
+        // an exact multiple of `l`. Changing `lower_limit` to a non-multiple of
+        // `l` would break that invariant and cause `compress()` to read
+        // uninitialized slots from a partially full leaf.
         if index < self.lower_limit && self.k > 2 {
             self.compress();
         }
@@ -311,7 +329,7 @@ impl<T> HashedArrayTree<T> {
                 self.count
             );
         }
-        // retreive the value at index before overwriting
+        // retrieve the value at index before overwriting
         let block = index >> self.k;
         let slot = index & self.k_mask;
         unsafe {
@@ -374,7 +392,7 @@ impl<T> HashedArrayTree<T> {
     ///
     /// Constant time.
     pub fn capacity(&self) -> usize {
-        (1 << self.k) * self.index.len()
+        self.l * self.index.len()
     }
 
     /// Returns true if the array has a length of 0.
@@ -551,7 +569,10 @@ impl<T> HashedArrayTree<T> {
         let mut prev = unsafe { index[0].read() };
         let mut slot = 1;
         for buffer in index.into_iter() {
-            while slot < old_l {
+            // Drive the read by `remaining` rather than leaf geometry: once the
+            // live elements are exhausted, only deallocate the remaining leaves
+            // instead of reading their uninitialized slots.
+            while slot < old_l && remaining > 0 {
                 let current = unsafe { buffer.add(slot).read() };
                 if same_bucket(&current, &prev) {
                     drop(current);
@@ -560,9 +581,6 @@ impl<T> HashedArrayTree<T> {
                     prev = current;
                 }
                 remaining -= 1;
-                if remaining == 0 {
-                    break;
-                }
                 slot += 1;
             }
             unsafe {
@@ -582,13 +600,15 @@ impl<T> HashedArrayTree<T> {
         other.count = 0;
         let layout = Layout::array::<T>(other.l).expect("unexpected overflow");
         for buffer in index.into_iter() {
-            for slot in 0..other.l {
+            // Drive the read by `remaining` rather than leaf geometry: once the
+            // live elements are exhausted, only deallocate the remaining leaves
+            // instead of reading their uninitialized slots.
+            let mut slot = 0;
+            while slot < other.l && remaining > 0 {
                 let value = unsafe { buffer.add(slot).read() };
                 self.push(value);
                 remaining -= 1;
-                if remaining == 0 {
-                    break;
-                }
+                slot += 1;
             }
             unsafe {
                 dealloc(buffer as *mut u8, layout);
@@ -610,8 +630,11 @@ impl<T> HashedArrayTree<T> {
     ///
     /// O(N)
     pub fn split_off(&mut self, at: usize) -> Self {
-        if at >= self.count {
-            panic!("index out of bounds: {at}");
+        if at > self.count {
+            panic!(
+                "`at` split index (is {at}) should be <= len (is {})",
+                self.count
+            );
         }
         // Unlike Vec, cannot simply cut the array into two parts, the structure
         // is built around the number of elements in the array, and that changes
@@ -624,18 +647,22 @@ impl<T> HashedArrayTree<T> {
         while self.count > at {
             other.push(self.raw_pop());
         }
-        let mut low = 0;
-        let mut high = other.count - 1;
-        while low < high {
-            unsafe {
-                let lp = other.index[low >> other.k].add(low & other.k_mask);
-                let value = lp.read();
-                let hp = other.index[high >> other.k].add(high & other.k_mask);
-                std::ptr::copy(hp, lp, 1);
-                hp.write(value);
+        // `at == self.count` yields an empty `other`, and a single element needs
+        // no reversal; guard against the `other.count - 1` underflow in both.
+        if other.count > 1 {
+            let mut low = 0;
+            let mut high = other.count - 1;
+            while low < high {
+                unsafe {
+                    let lp = other.index[low >> other.k].add(low & other.k_mask);
+                    let value = lp.read();
+                    let hp = other.index[high >> other.k].add(high & other.k_mask);
+                    std::ptr::copy(hp, lp, 1);
+                    hp.write(value);
+                }
+                low += 1;
+                high -= 1;
             }
-            low += 1;
-            high -= 1;
         }
         other
     }
@@ -712,6 +739,8 @@ impl<T: Clone> Clone for HashedArrayTree<T> {
 }
 
 unsafe impl<T: Send> Send for HashedArrayTree<T> {}
+
+unsafe impl<T: Sync> Sync for HashedArrayTree<T> {}
 
 impl<A> FromIterator<A> for HashedArrayTree<A> {
     fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
@@ -902,7 +931,7 @@ impl<T> Drop for ArrayIntoIter<T> {
 /// Creates a [`HashedArrayTree`] containing the arguments.
 ///
 /// `hat!` allows `HashedArrayTree`s to be defined with the same syntax as array
-/// expressions, much like the `vec!` mocro from the standard library.
+/// expressions, much like the `vec!` macro from the standard library.
 #[macro_export]
 macro_rules! hat {
     () => {
@@ -1355,10 +1384,33 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "index out of bounds: 10")]
+    #[should_panic(expected = "`at` split index (is 10) should be <= len (is 0)")]
     fn test_split_off_bounds_panic() {
         let mut sut = HashedArrayTree::<usize>::new();
         sut.split_off(10);
+    }
+
+    #[test]
+    fn test_split_off_at_len() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        for value in 0..13 {
+            sut.push(value);
+        }
+        // splitting at exactly len yields an empty array and leaves self intact
+        let other = sut.split_off(sut.len());
+        assert_eq!(sut.len(), 13);
+        assert!(other.is_empty());
+        for value in 0..13 {
+            assert_eq!(sut[value], value);
+        }
+    }
+
+    #[test]
+    fn test_split_off_empty_at_zero() {
+        let mut sut = HashedArrayTree::<usize>::new();
+        let other = sut.split_off(0);
+        assert!(sut.is_empty());
+        assert!(other.is_empty());
     }
 
     #[test]

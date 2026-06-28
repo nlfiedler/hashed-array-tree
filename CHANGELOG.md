@@ -5,6 +5,16 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 This file follows the convention described at
 [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+### Added
+- Add `Sync` implementation for elements that implement `Sync`.
+### Fixed
+- `split_off()` no longer panics when `at` equals the length; it now returns an
+  empty array, as documented.
+- Avoid reading uninitialized leaf slots in `append()` and `dedup_by()`.
+### Changed
+- Document that zero-sized types are not supported.
+
 ## [1.3.0] - 2026-04-11
 ### Added
 - Add `iter_mut()` implementation for `HashedArrayTree`.
